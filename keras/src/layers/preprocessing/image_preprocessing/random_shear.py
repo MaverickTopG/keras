@@ -310,7 +310,7 @@ class RandomShear(BaseImagePreprocessingLayer):
             bounding_boxes = convert_format(
                 bounding_boxes,
                 source=self.bounding_box_format,
-                target="rel_xyxy",
+                target="xyxy",
                 height=input_height,
                 width=input_width,
                 dtype=self.compute_dtype,
@@ -322,12 +322,12 @@ class RandomShear(BaseImagePreprocessingLayer):
                 bounding_boxes=bounding_boxes,
                 height=input_height,
                 width=input_width,
-                bounding_box_format="rel_xyxy",
+                bounding_box_format="xyxy",
             )
 
             bounding_boxes = convert_format(
                 bounding_boxes,
-                source="rel_xyxy",
+                source="xyxy",
                 target=self.bounding_box_format,
                 height=input_height,
                 width=input_width,
@@ -339,57 +339,40 @@ class RandomShear(BaseImagePreprocessingLayer):
         return bounding_boxes
 
     def _shear_bboxes(self, bounding_boxes, transformation):
-        shear_factor = self.backend.ops.cast(
+        # `_get_shear_matrix` maps output pixel indices to input pixel indices,
+        # so boxes move by its inverse. Pixel `i` has its center at `i + 0.5`
+        # in box coordinates and at `i` in the indices the matrix works on.
+        ops = self.backend.ops
+        shear_factor = ops.cast(
             transformation["shear_factor"], dtype=self.compute_dtype
         )
-        shear_x_amount, shear_y_amount = self.backend.ops.numpy.split(
-            shear_factor, 2, axis=-1
+        shear_x, shear_y = ops.numpy.split(
+            ops.numpy.expand_dims(shear_factor, axis=-1), 2, axis=-2
+        )
+        determinant = 1 - shear_x * shear_y
+        # The matrix has no inverse when `shear_x * shear_y == 1`. Avoid
+        # dividing by zero so that boxes can still be clipped to the image. The
+        # bound stays a normal number in float16, unlike `backend.epsilon()`.
+        epsilon = ops.numpy.full_like(determinant, 1e-3)
+        determinant = ops.numpy.where(
+            ops.numpy.abs(determinant) < epsilon, epsilon, determinant
         )
 
-        x1, y1, x2, y2 = self.backend.ops.numpy.split(
-            bounding_boxes["boxes"], 4, axis=-1
-        )
-        x1 = self.backend.ops.numpy.squeeze(x1, axis=-1)
-        y1 = self.backend.ops.numpy.squeeze(y1, axis=-1)
-        x2 = self.backend.ops.numpy.squeeze(x2, axis=-1)
-        y2 = self.backend.ops.numpy.squeeze(y2, axis=-1)
+        x1, y1, x2, y2 = ops.numpy.split(bounding_boxes["boxes"], 4, axis=-1)
+        x = ops.numpy.concatenate([x1, x1, x2, x2], axis=-1) - 0.5
+        y = ops.numpy.concatenate([y1, y2, y1, y2], axis=-1) - 0.5
+        sheared_x = (x - shear_x * y) / determinant + 0.5
+        sheared_y = (y - shear_y * x) / determinant + 0.5
 
-        if shear_x_amount is not None:
-            x1_top = x1 - (shear_x_amount * y1)
-            x1_bottom = x1 - (shear_x_amount * y2)
-            x1 = self.backend.ops.numpy.where(
-                shear_x_amount < 0, x1_top, x1_bottom
-            )
-
-            x2_top = x2 - (shear_x_amount * y1)
-            x2_bottom = x2 - (shear_x_amount * y2)
-            x2 = self.backend.ops.numpy.where(
-                shear_x_amount < 0, x2_bottom, x2_top
-            )
-
-        if shear_y_amount is not None:
-            y1_left = y1 - (shear_y_amount * x1)
-            y1_right = y1 - (shear_y_amount * x2)
-            y1 = self.backend.ops.numpy.where(
-                shear_y_amount > 0, y1_right, y1_left
-            )
-
-            y2_left = y2 - (shear_y_amount * x1)
-            y2_right = y2 - (shear_y_amount * x2)
-            y2 = self.backend.ops.numpy.where(
-                shear_y_amount > 0, y2_left, y2_right
-            )
-
-        boxes = self.backend.ops.numpy.concatenate(
+        bounding_boxes["boxes"] = ops.numpy.stack(
             [
-                self.backend.ops.numpy.expand_dims(x1, axis=-1),
-                self.backend.ops.numpy.expand_dims(y1, axis=-1),
-                self.backend.ops.numpy.expand_dims(x2, axis=-1),
-                self.backend.ops.numpy.expand_dims(y2, axis=-1),
+                ops.numpy.min(sheared_x, axis=-1),
+                ops.numpy.min(sheared_y, axis=-1),
+                ops.numpy.max(sheared_x, axis=-1),
+                ops.numpy.max(sheared_y, axis=-1),
             ],
             axis=-1,
         )
-        bounding_boxes["boxes"] = boxes
 
         return bounding_boxes
 
